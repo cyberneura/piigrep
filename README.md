@@ -32,6 +32,13 @@ brew install cyberneura/tap/piigrep
 cargo install piigrep
 ```
 
+Binaries for Apple Silicon macOS and x86_64 GNU/Linux (glibc; not Alpine or
+other musl systems) are also on the
+[releases page](https://github.com/cyberneura/piigrep/releases). The macOS
+binary is not notarized: Homebrew and cargo do not quarantine what they
+install, but a browser does, and macOS then refuses to run it. Clear the flag
+with `xattr -d com.apple.quarantine piigrep`.
+
 ## Usage
 
 ```sh

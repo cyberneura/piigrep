@@ -84,7 +84,10 @@ when the repository variable `PUBLISH_CRATES` is `true` and the secret
 from the GitHub Release (`scripts/crate-indexed.sh` asks the sparse index), and
 the crate is published from the release tag, so a failed publish is retried by
 the next push even though the release is already out. The macOS binary is signed with a
-Developer ID and notarised in the build job (repository secrets
+Developer ID and notarised in a `sign` job of its own, on a fresh runner that
+only downloads the built binary and never runs cargo: in the build job any
+dependency's build script could put its own `openssl` or `security` first on
+PATH for later steps and take the certificate (repository secrets
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
 `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`; the build stops if one is
 missing). The cask and browser downloads quarantine the binary, so an unsigned

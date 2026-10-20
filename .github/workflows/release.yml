@@ -107,13 +107,17 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          # An index that cannot be read must not hold up the GitHub Release, which
+          # every other job here waits on. "Maybe" sends it to the crates job,
+          # which asks again before publishing and stops there if it still cannot
+          # tell -- after the release is out.
           answer=$(scripts/crate-indexed.sh piigrep "$VERSION")
           case "$answer" in
-            no) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
             yes) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            no) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
             *)
-              echo "::error::could not tell whether piigrep ${VERSION} is on crates.io (${answer}). Not guessing."
-              exit 1
+              echo "::warning::could not tell whether piigrep ${VERSION} is on crates.io (${answer}); the crates job will ask again"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
               ;;
           esac
 

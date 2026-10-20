@@ -86,10 +86,14 @@ impl Fm {
             Err(error) => return Err(error).context("could not run `fm available`"),
         };
         if !available.status.success() {
-            bail!(
-                "the on-device model is not available: {}",
+            // The reason, and what to do about it (`sudo fm license` on a machine
+            // where the terms were never accepted), may be on either stream.
+            let said = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&available.stderr).trim(),
                 String::from_utf8_lossy(&available.stdout).trim()
             );
+            bail!("the on-device model is not available: {}", said.trim());
         }
 
         // Built with `fm schema` on every run rather than kept as a file: `fm`
@@ -362,16 +366,19 @@ fn has_japanese(s: &str) -> bool {
         .any(|c| matches!(c, '\u{3040}'..='\u{30ff}' | '\u{4e00}'..='\u{9fff}'))
 }
 
-/// `Taro Yamada`, `Mary Ann Smith`.
+/// `Taro Yamada`, `Mary Ann Smith`, `Mary-Jane Watson`, `John O'Connor`,
+/// `José García`: two or more capitalized words, each part of a hyphenated or
+/// apostrophized word capitalized too. `TORICO` and `koto0120` are not.
 fn is_western_name(s: &str) -> bool {
+    let capitalized = |part: &str| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(char::is_uppercase) && chars.all(char::is_lowercase)
+    };
     let words: Vec<&str> = s.split(' ').collect();
     words.len() >= 2
-        && words.iter().all(|word| {
-            let mut chars = word.chars();
-            chars.next().is_some_and(|c| c.is_ascii_uppercase())
-                && chars.clone().count() > 0
-                && chars.all(|c| c.is_ascii_lowercase())
-        })
+        && words
+            .iter()
+            .all(|word| word.chars().count() >= 2 && word.split(['-', '\'']).all(capitalized))
 }
 
 /// A single run of ASCII letters, digits, `_` and `-`: a user ID, a handle, a
@@ -524,6 +531,15 @@ mod tests {
         assert_eq!(accept("name", "koto0120"), None);
         assert_eq!(accept("name", "gionmaru"), None);
         assert_eq!(accept("name", "TORICO"), None);
+        for name in ["Mary-Jane Watson", "John O'Connor", "José García"] {
+            assert_eq!(
+                accept("name", name),
+                Some((Kind::Name, name.into())),
+                "{name}"
+            );
+        }
+        assert_eq!(accept("name", "TORICO Inc"), None);
+        assert_eq!(accept("name", "A B"), None);
     }
 
     #[test]

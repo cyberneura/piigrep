@@ -1,0 +1,24 @@
+[package]
+name = "piigrep"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Find personal information (emails, phone numbers, My Numbers, card numbers, names, addresses) in files, on-device"
+license = "MIT"
+repository = "https://github.com/cyberneura/piigrep"
+readme = "README.md"
+keywords = ["pii", "privacy", "grep", "japanese", "scanner"]
+categories = ["command-line-utilities", "text-processing"]
+# The issue notes are local (ignored by git), but cargo package would take them
+# from a working copy that has them.
+exclude = ["/_issues", "/.github", "/scripts"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+encoding_rs = "0.8.42"
+ignore = "0.4.33"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"

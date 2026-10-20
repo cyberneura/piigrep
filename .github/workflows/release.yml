@@ -1,0 +1,420 @@
+name: Release
+
+# Releases follow the version in Cargo.toml: change it on main and the release
+# happens. Nothing else starts one.
+#
+# What decides whether to release is not the diff -- squash, rebase and a direct
+# push each leave a different one -- but whether that version has been released
+# already. Asking that makes the workflow idempotent: run again over a released
+# version and nothing happens; run again over a failed one and it carries on.
+#
+# Every push to main is looked at, with no path filter. Filtering on Cargo.toml
+# would be cheaper, but it would also mean that a release which failed on the
+# build, the workflow or the code itself could not be retried by pushing the fix
+# -- the fix does not touch Cargo.toml. The check below costs a checkout and one
+# API call, which is less than the recovery it would otherwise cost.
+on:
+  push:
+    branches: [main]
+  # For a version that is right but whose run failed for a reason since fixed and
+  # not yet pushed. The same check applies, so this cannot republish anything.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialised so that two pushes in quick succession cannot build the same version
+# twice. `queue: max` holds up to 100 pending rather than the default `single`,
+# which keeps one and cancels the rest; it may not be paired with
+# `cancel-in-progress: true`.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+      publish_crate: ${{ steps.crate.outputs.publish }}
+    steps:
+      # A dispatch names its own ref, and a branch carrying an unreleased version
+      # would otherwise be built and published from wherever it sits. Releases come
+      # from main; a push cannot be anything else, but a dispatch can.
+      - name: Refuse to release from anywhere but main
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::releases come from main, and this run is on ${REF}"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "piigrep") | .version')
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the version out of Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this version still needs releasing
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # This endpoint answers for published releases only -- a draft has no tag
+          # for it to find -- which is the question being asked here. A draft left
+          # by a failed run is dealt with in the release job, which can see it.
+          #
+          # Only 404 counts as "not released". A rate limit or an outage read that
+          # way would build and publish a version that is already out.
+          status=$(gh api "repos/${GH_REPO}/releases/tags/v${VERSION}" \
+            --silent --include 2>/dev/null | head -n 1 | awk '{print $2}' || true)
+          case "$status" in
+            404)
+              echo "release=true" >> "$GITHUB_OUTPUT"
+              echo "Releasing v${VERSION}"
+              ;;
+            200)
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} is already released; nothing to do."
+              ;;
+            *)
+              echo "::error::could not tell whether v${VERSION} exists (HTTP ${status:-none}). Not guessing."
+              exit 1
+              ;;
+          esac
+
+      # Asked apart from the GitHub Release: if the release went out and the
+      # publish then failed, the next push finds the release done and would
+      # otherwise never publish the crate.
+      - name: Decide whether the crate still needs publishing
+        id: crate
+        if: vars.PUBLISH_CRATES == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          answer=$(scripts/crate-indexed.sh piigrep "$VERSION")
+          case "$answer" in
+            no) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            yes) echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::could not tell whether piigrep ${VERSION} is on crates.io (${answer}). Not guessing."
+              exit 1
+              ;;
+          esac
+
+  # The gate. Called rather than written out here so that a pull request and a
+  # release run the same checks from the same file; being called puts its jobs
+  # in this run, which is what lets `needs` hold the build back.
+  #
+  # It hangs off `plan` under the same condition as the build, so a push to main
+  # that does not change the version costs nothing. What that leaves untested is
+  # covered on the way in: test.yml also runs on every pull request.
+  test:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [plan, test]
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon only; `fm` exists only on macOS 27, which Intel Macs do
+          # not run. Not signed: it ships as a Homebrew formula, and formulae do
+          # not quarantine what they install.
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          # Patterns only (--fm needs macOS). A glibc build, not a portable one.
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+
+    steps:
+      # persist-credentials: false keeps the token out of .git/config. Actions are
+      # pinned to a commit SHA: a moved tag would run someone else's code in a job
+      # whose output is what users install.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Pin a SHA from master, not from a generated branch like `stable`: those
+      # commits are collected once the branch moves on, and the run then fails
+      # before Rust is even installed.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust (cargo + target)
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          NAME="piigrep-v${VERSION}-${TARGET}"
+          mkdir -p "dist/$NAME"
+          cp "target/${TARGET}/release/piigrep" "dist/$NAME/"
+          cp README.md "dist/$NAME/"
+          # The licenses travel with the binary as files too, not only inside it
+          # (`piigrep --license`).
+          cp LICENSE THIRD-PARTY-NOTICES.txt "dist/$NAME/"
+          # The archive carries its own directory rather than unpacking into the
+          # current one; Homebrew descends into a single top-level directory.
+          tar -czf "dist/$NAME.tar.gz" -C dist "$NAME"
+          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  # Every target has to be in hand first. The release is assembled as a draft and
+  # published only once its assets are all there: `gh release create` uploads
+  # after creating, so a failure partway would otherwise leave a published release
+  # missing a platform.
+  release:
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          EXPECTED_ASSETS: "2"
+        run: |
+          # `--paginate` hands back one array per page, so the pages are flattened
+          # into a single one before anything asks a question of them.
+          set -o pipefail
+          # Drafts left by a run that failed partway are cleared, so that the same
+          # version can be built again instead of being blocked by its own remains.
+          # A published release is never touched: it is the thing this workflow
+          # exists to produce.
+          #
+          # The releases are listed rather than looked up by tag. A draft has no tag
+          # for that endpoint to find, so a lookup would report nothing and the
+          # create below would add a *second* draft under the same name -- from
+          # there, which one gets its assets counted, or published, is a coin toss.
+          releases=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '.[]' | jq -s '.') || {
+            echo "::error::could not list the releases. Not guessing."
+            exit 1
+          }
+          if jq -e --arg tag "v${VERSION}" \
+            'any(.[]; .tag_name == $tag and .draft == false)' <<< "$releases" >/dev/null; then
+            echo "::error::v${VERSION} is published already; refusing to touch it."
+            exit 1
+          fi
+          # Every same-named draft, not just one: an earlier failure may have left
+          # more than one behind.
+          for id in $(jq -r --arg tag "v${VERSION}" \
+            '.[] | select(.tag_name == $tag and .draft) | .id' <<< "$releases"); do
+            # Deleted by id, and without --cleanup-tag: a draft has no tag to clean
+            # up, and asking for one fails the step after the draft is already gone.
+            echo "removing leftover draft $id"
+            gh api -X DELETE "repos/${GH_REPO}/releases/${id}"
+          done
+
+          # The checksums go into the notes so that a formula can be fixed by hand
+          # without fetching the assets again.
+          {
+            echo "## Checksums"
+            echo
+            echo '```'
+            (cd dist && sha256sum *.tar.gz)
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+
+          gh release create "v${VERSION}" \
+            --draft \
+            --target "$COMMIT" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*.tar.gz
+
+          count=$(gh release view "v${VERSION}" --json assets --jq '.assets | length')
+          if [ "$count" -ne "$EXPECTED_ASSETS" ]; then
+            echo "::error::the draft carries $count assets, expected $EXPECTED_ASSETS; leaving it unpublished"
+            exit 1
+          fi
+          gh release edit "v${VERSION}" --draft=false --latest
+
+  # Publishing cannot be undone, so this waits to be switched on with
+  # `gh variable set PUBLISH_CRATES --body true` rather than being on by default.
+  #
+  # Runs after a release made in this run, or on its own when the release was
+  # already out before this run. `skipped` alone is not enough for the latter: a
+  # failed test or build skips `release` too, and must stop this as well.
+  crates:
+    needs: [plan, release]
+    if: >-
+      !cancelled()
+      && needs.plan.result == 'success'
+      && needs.plan.outputs.publish_crate == 'true'
+      && (needs.release.result == 'success'
+          || (needs.plan.outputs.release == 'false' && needs.release.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The released tag, not the pushed commit: on a retry, main may have moved
+      # on, and the crate has to be what the release was built from.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: v${{ needs.plan.outputs.version }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      # The index was asked about VERSION; a tag pointing at a commit with another
+      # version would publish that one instead, unchecked.
+      - name: Check the tag carries the version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tagged=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "piigrep") | .version')
+          if [ "$tagged" != "$VERSION" ]; then
+            echo "::error::v${VERSION} points at a commit whose Cargo.toml says ${tagged:-nothing}"
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::PUBLISH_CRATES is on but CARGO_REGISTRY_TOKEN is not set. Add it with 'gh secret set CARGO_REGISTRY_TOKEN'."
+            exit 1
+          fi
+
+          indexed() {
+            scripts/crate-indexed.sh "$1" "$VERSION"
+          }
+
+          # Publishing cannot be undone, so the crate is looked up first: a rerun
+          # after the release went out must not try to publish it again.
+          publish() {
+            name=$1
+            case "$(indexed "$name")" in
+              yes) echo "${name} ${VERSION} is already on crates.io"; return ;;
+              no) ;;
+              *)
+                echo "::error::could not tell whether ${name} ${VERSION} is published. Not guessing."
+                exit 1
+                ;;
+            esac
+
+            # A failure here is not proof that nothing was published: the registry
+            # can take the crate and the response still be lost. The index is the
+            # only thing that settles it.
+            if ! cargo publish -p "$name"; then
+              for _ in $(seq 12); do
+                sleep 10
+                case "$(indexed "$name")" in
+                  yes)
+                    echo "publishing ${name} ${VERSION} reported a failure, but it is in the index"
+                    return
+                    ;;
+                  no) ;;
+                  *)
+                    echo "::error::publishing ${name} ${VERSION} failed and the index cannot be read."
+                    exit 1
+                    ;;
+                esac
+              done
+              echo "::error::publishing ${name} ${VERSION} failed and it is not in the index"
+              exit 1
+            fi
+
+            # Not done until the index has it: a rerun reads the index to decide
+            # whether to publish again.
+            for _ in $(seq 30); do
+              sleep 10
+              case "$(indexed "$name")" in
+                yes) return ;;
+                no) ;;
+                *)
+                  echo "::error::${name} ${VERSION} was published, but the index could not be read."
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "::error::${name} ${VERSION} never reached the index"
+            exit 1
+          }
+
+          publish piigrep
+
+      # After the publish, never before it: an announcement of a version nobody can
+      # install yet sends people to fetch something that is not there. Neither of
+      # these may fail the run -- the crate is out either way, and a webhook that is
+      # down is not a reason to look at a red release.
+      - name: Say so
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ALEXA_WEBHOOK_TOKEN: ${{ secrets.ALEXA_WEBHOOK_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -n --arg text "piigrep ${VERSION} is on crates.io. <${RUN_URL}|Detail>" \
+              '{channel: "C06TSP3NVJL", username: "crates.io", icon_emoji: ":package:", text: $text}' \
+              | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "::notice::SLACK_WEBHOOK_URL is not set; not announcing to Slack"
+          fi
+
+          if [ -n "$ALEXA_WEBHOOK_TOKEN" ]; then
+            jq -n --arg text "pii grep ${VERSION} is on crates dot io." \
+              '{device: "書斎 Echo Dot", text: $text}' \
+              | curl -sS -X POST -H 'Content-Type: application/json' \
+                  -H "Authorization: Bearer $ALEXA_WEBHOOK_TOKEN" \
+                  -d @- "https://alexa-webhook.ytyng.com/speak"
+          else
+            echo "::notice::ALEXA_WEBHOOK_TOKEN is not set; not speaking"
+          fi

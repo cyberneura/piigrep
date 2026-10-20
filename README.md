@@ -27,8 +27,8 @@ when they start with a BOM. Binary files are skipped.
 ## Install
 
 ```sh
-brew install cyberneura/tap/piigrep
-# or
+brew install cyberneura/tap/piigrep          # formula
+brew install --cask cyberneura/tap/piigrep   # or the cask (macOS)
 cargo install piigrep
 ```
 

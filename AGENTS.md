@@ -89,6 +89,6 @@ Developer ID and notarised in the build job (repository secrets
 `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`; the build stops if one is
 missing). The cask and browser downloads quarantine the binary, so an unsigned
 one would be refused.
-The Homebrew formula lives in `cyberneura/homebrew-tap`
-(`Formula/piigrep.rb`); the tap updates it from the latest release on its own
-schedule.
+The formula and the cask live in `cyberneura/homebrew-tap`
+(`Formula/piigrep.rb`, `Casks/piigrep.rb`); the tap updates both from the
+latest release on its own schedule.

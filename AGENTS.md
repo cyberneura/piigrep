@@ -83,7 +83,12 @@ when the repository variable `PUBLISH_CRATES` is `true` and the secret
 `CARGO_REGISTRY_TOKEN` is set. Whether to publish the crate is decided apart
 from the GitHub Release (`scripts/crate-indexed.sh` asks the sparse index), and
 the crate is published from the release tag, so a failed publish is retried by
-the next push even though the release is already out. The Homebrew formula lives in
-`cyberneura/homebrew-tap` (`Formula/piigrep.rb`); the tap updates it from the
-latest release on its own schedule. Binaries are not signed: a formula does not
-quarantine what it installs.
+the next push even though the release is already out. The macOS binary is signed with a
+Developer ID and notarised in the build job (repository secrets
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`; the build stops if one is
+missing). The cask and browser downloads quarantine the binary, so an unsigned
+one would be refused.
+The Homebrew formula lives in `cyberneura/homebrew-tap`
+(`Formula/piigrep.rb`); the tap updates it from the latest release on its own
+schedule.

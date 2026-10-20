@@ -137,20 +137,21 @@ jobs:
       matrix:
         include:
           # Apple Silicon only; `fm` exists only on macOS 27, which Intel Macs do
-          # not run. Not signed: it ships as a Homebrew formula, and formulae do
-          # not quarantine what they install.
+          # not run. Signed with a Developer ID and notarised: the Homebrew cask
+          # and a browser download both quarantine the binary, and without both
+          # the first run is refused.
           - platform: macos-latest
             target: aarch64-apple-darwin
           # Patterns only (--fm needs macOS). A glibc build, not a portable one.
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      # persist-credentials: false keeps the token out of .git/config. Actions are
-      # pinned to a commit SHA: a moved tag would run someone else's code in a job
-      # whose output is what users install.
+      # persist-credentials: false keeps the token out of .git/config. Everything
+      # is pinned to a commit SHA because this job holds the signing certificate:
+      # a moved tag would be enough to take it.
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -168,8 +169,97 @@ jobs:
       - name: Cache Rust (cargo + target)
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # A missing secret does not merely skip codesign, it goes unnoticed: an
+      # unsigned archive would ship as though it had been signed.
+      - name: Check macOS signing secrets
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}. Run deploy-github-secret-apple-building.sh to set them."
+            exit 1
+          fi
+          echo "All signing and notarisation secrets are present."
+
+      - name: Import Apple Developer certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          # codesign looks identities up in the search list rather than in the
+          # default keychain, so the new keychain has to be added to it.
+          security list-keychains -d user -s build.keychain
+          # find-identity exits 0 even with nothing to show, so the check has to
+          # look at what it printed.
+          security find-identity -v -p codesigning | grep -q "Developer ID Application" || {
+            echo "::error::no 'Developer ID Application' identity in the keychain search list"
+            exit 1
+          }
+          rm "$RUNNER_TEMP/certificate.p12"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Notarisation needs the hardened runtime (--options runtime). A bare binary
+      # cannot be stapled -- stapling takes a .app, .dmg or .pkg -- so the ticket
+      # stays with Apple and Gatekeeper fetches it. That covers a download, and
+      # leaves only a first run with no network refused.
+      - name: Sign and notarise
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/${TARGET}/release/piigrep"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          # notarytool takes a zip, pkg or dmg, so the binary is wrapped only to be
+          # submitted. What ships is the tar.gz below; the ticket is bound to the
+          # signature, which is the same in either container.
+          ditto -c -k --keepParent "$BIN" "$RUNNER_TEMP/notarize.zip"
+          # The verdict is read rather than left to the exit code: a submission
+          # that comes back Invalid is still a submission that completed.
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notarize.json"
+          cat "$RUNNER_TEMP/notarize.json"
+          status=$(jq -r .status "$RUNNER_TEMP/notarize.json")
+          if [ "$status" != "Accepted" ]; then
+            id=$(jq -r .id "$RUNNER_TEMP/notarize.json")
+            xcrun notarytool log "$id" --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::notarisation came back $status"
+            exit 1
+          fi
+
 
       - name: Package
         id: package

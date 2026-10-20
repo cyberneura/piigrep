@@ -335,9 +335,9 @@ fn run(args: Args) -> anyhow::Result<ExitCode> {
     })();
     match written {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-            return Ok(ExitCode::from(if scanner.found { 0 } else { 1 }));
-        }
+        // The reader having seen enough is not an error, but what went wrong
+        // before it stopped reading still decides the status below.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
         Err(error) => return Err(error.into()),
     }
 

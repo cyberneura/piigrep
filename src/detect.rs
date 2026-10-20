@@ -8,7 +8,9 @@ use crate::{Hit, Kind, Source};
 /// every position and ran at about 5 MB/s.
 #[derive(Clone, Copy)]
 enum Boundary {
-    None,
+    /// After the address only: the local part already takes in everything an
+    /// address can start with. `user@example.com123` is not `user@example.com`.
+    Email,
     /// Digits and hyphens: `1090-1234-5678` is not a phone number.
     Phone,
     /// Digits and ID-like characters: `CP2026090106010023` is a campaign code,
@@ -20,7 +22,7 @@ enum Boundary {
 impl Boundary {
     fn blocks(self, c: char) -> bool {
         match self {
-            Boundary::None => false,
+            Boundary::Email => c.is_ascii_alphanumeric() || c == '_' || c == '-',
             Boundary::Phone => c.is_ascii_digit() || c == '-',
             Boundary::Id => c.is_ascii_alphanumeric() || c == '_' || c == '-',
         }
@@ -65,7 +67,7 @@ impl Detector {
             (
                 Kind::Email,
                 r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}".to_string(),
-                Boundary::None,
+                Boundary::Email,
             ),
             (Kind::Phone, phone, Boundary::Phone),
             (
@@ -130,7 +132,8 @@ impl Detector {
             let mut card = 0;
             while let Some(m) = pattern.regex.find_at(text, position) {
                 // 〒 marks a postal code whatever comes before it.
-                let before_clear = m.as_str().starts_with('〒')
+                let before_clear = pattern.kind == Kind::Email
+                    || m.as_str().starts_with('〒')
                     || pattern
                         .boundary
                         .clear(text[..m.start()].chars().next_back());
@@ -169,6 +172,10 @@ impl Detector {
                         .find(|&(_, c)| !pattern.boundary.blocks(c))
                         .map_or(rest.len(), |(i, _)| i);
                     position = m.start() + run.max(rest.chars().next().map_or(1, char::len_utf8));
+                } else if pattern.kind == Kind::Email {
+                    // A later start in the same local part ends at the same place
+                    // and fails the same way.
+                    position = m.end();
                 } else {
                     // What lookaround would have done: try the next start rather
                     // than skipping the whole rejected match, so a valid number
@@ -512,6 +519,38 @@ mod tests {
         // Assert
         assert!(my_number_check_digit_ok("400000000009"));
         assert_eq!(kinds_and_values(card), one(Kind::CreditCard, card));
+    }
+
+    #[test]
+    fn finds_an_email_with_an_underscore_and_one_ending_a_sentence() {
+        assert_eq!(
+            kinds_and_values("from foo_bar@example.jp."),
+            one(Kind::Email, "foo_bar@example.jp")
+        );
+    }
+
+    #[test]
+    fn ignores_an_email_whose_domain_runs_on() {
+        assert_eq!(kinds_and_values("user@example.com123"), vec![]);
+        assert_eq!(kinds_and_values("user@example.com-x"), vec![]);
+    }
+
+    #[test]
+    fn a_long_local_part_with_no_address_is_scanned_in_linear_time() {
+        // Arrange
+        let line = "a".repeat(1_000_000) + "@example.com1";
+        let started = std::time::Instant::now();
+
+        // Act
+        let found = kinds_and_values(&line);
+
+        // Assert
+        assert_eq!(found, vec![]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

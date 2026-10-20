@@ -9,7 +9,9 @@ use crate::{Hit, Kind, Source};
 #[derive(Clone, Copy)]
 enum Boundary {
     /// After the address only: the local part already takes in everything an
-    /// address can start with. `user@example.com123` is not `user@example.com`.
+    /// address can start with. `user@example.com123` is not `user@example.com`,
+    /// and neither is `user@example.com-x`, but `_user@example.com_` (Markdown
+    /// emphasis) and `user@example.com-` end with the address.
     Email,
     /// Digits and hyphens: `1090-1234-5678` is not a phone number.
     Phone,
@@ -22,7 +24,7 @@ enum Boundary {
 impl Boundary {
     fn blocks(self, c: char) -> bool {
         match self {
-            Boundary::Email => c.is_ascii_alphanumeric() || c == '_' || c == '-',
+            Boundary::Email => c.is_ascii_alphanumeric(),
             Boundary::Phone => c.is_ascii_digit() || c == '-',
             Boundary::Id => c.is_ascii_alphanumeric() || c == '_' || c == '-',
         }
@@ -137,7 +139,13 @@ impl Detector {
                     || pattern
                         .boundary
                         .clear(text[..m.start()].chars().next_back());
-                let after_clear = pattern.boundary.clear(text[m.end()..].chars().next());
+                let mut after = text[m.end()..].chars();
+                let after_clear = match (pattern.kind, after.next()) {
+                    (Kind::Email, Some('-' | '_')) => {
+                        !after.next().is_some_and(|c| c.is_ascii_alphanumeric())
+                    }
+                    (_, next) => pattern.boundary.clear(next),
+                };
                 let valid = match pattern.kind {
                     // The first 12 digits of a card number can pass the check digit
                     // on their own (`4111 1111 1111 1111`, `400000000009 0003`).
@@ -533,6 +541,19 @@ mod tests {
     fn ignores_an_email_whose_domain_runs_on() {
         assert_eq!(kinds_and_values("user@example.com123"), vec![]);
         assert_eq!(kinds_and_values("user@example.com-x"), vec![]);
+        assert_eq!(kinds_and_values("user@example.com_x"), vec![]);
+    }
+
+    #[test]
+    fn finds_an_email_in_markdown_emphasis_or_before_a_trailing_dash() {
+        assert_eq!(
+            kinds_and_values("contact _user@example.com_ now"),
+            one(Kind::Email, "_user@example.com")
+        );
+        assert_eq!(
+            kinds_and_values("user@example.com-"),
+            one(Kind::Email, "user@example.com")
+        );
     }
 
     #[test]

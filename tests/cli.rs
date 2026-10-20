@@ -159,6 +159,32 @@ fn searches_hidden_files() {
 }
 
 #[test]
+fn follows_a_symlink_given_by_name_but_not_one_met_while_walking() {
+    // Arrange
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "data/a.csv", "a@example.jp\n");
+    write(dir.path(), "outside/b.csv", "b@example.jp\n");
+    std::os::unix::fs::symlink(dir.path().join("data"), dir.path().join("data-link")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("data/a.csv"), dir.path().join("a-link.csv"))
+        .unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("outside"),
+        dir.path().join("data/outside-link"),
+    )
+    .unwrap();
+
+    // Act
+    let linked_dir = piigrep(dir.path(), &["-l", "data-link"]);
+    let linked_file = piigrep(dir.path(), &["-l", "a-link.csv"]);
+    let walked = piigrep(dir.path(), &["-l", "data"]);
+
+    // Assert
+    assert_eq!(stdout(&linked_dir), "data-link/a.csv\n");
+    assert_eq!(stdout(&linked_file), "a-link.csv\n");
+    assert_eq!(stdout(&walked), "data/a.csv\n");
+}
+
+#[test]
 fn glob_narrows_and_excludes() {
     // Arrange
     let dir = TempDir::new().unwrap();

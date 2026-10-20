@@ -287,6 +287,14 @@ fn run(args: Args) -> anyhow::Result<ExitCode> {
     }
     let read_stdin = paths.iter().any(|path| path.as_os_str() == "-");
     paths.retain(|path| path.as_os_str() != "-");
+    // A path given by name is searched even if it is a symlink; links met while
+    // walking are not followed. A trailing slash makes the walker open a linked
+    // directory as the directory, and keeps the path as given in the output.
+    for path in &mut paths {
+        if path.is_symlink() && path.is_dir() {
+            *path = path.join("");
+        }
+    }
 
     let written = (|| -> io::Result<()> {
         if read_stdin {
@@ -306,11 +314,15 @@ fn run(args: Args) -> anyhow::Result<ExitCode> {
                     continue;
                 }
             };
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
+            let is_file = entry.file_type().is_some_and(|t| t.is_file())
+                || (entry.depth() == 0 && entry.path().is_file());
+            if !is_file {
                 continue;
             }
             let label = display(entry.path());
-            match entry.metadata() {
+            // Followed, for a linked file given by name: the link's own size is not
+            // the file's.
+            match std::fs::metadata(entry.path()) {
                 Ok(metadata) if metadata.len() > args.max_filesize => {
                     scanner.skip(&label, "larger than --max-filesize");
                     continue;

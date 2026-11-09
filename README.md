@@ -2,6 +2,8 @@
 
 Find personal information in files, on-device.
 
+Website: https://www.cyberneura.com/app/piigrep
+
 ```console
 $ piigrep ~/exports
 customers.csv:2:email:taro@example.jp
